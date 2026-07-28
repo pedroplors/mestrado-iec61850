@@ -1,0 +1,5 @@
+﻿*.zip
+*.csv
+dataset_iec61850/
+__pycache__/
+.ipynb_checkpoints/
