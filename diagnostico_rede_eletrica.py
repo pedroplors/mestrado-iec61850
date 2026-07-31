@@ -63,6 +63,27 @@ em "Breaker Failure" e "Under Frequency", loss estagnada em ~1.05):
         época 25 vs 0.496 na época 40, a que efetivamente ia para o teste)
         -> checkpoint dos pesos com melhor fitness em validação, restaurado
         ao final do treino.
+
+Correções aplicadas nesta revisão (V3 — Fitness val 62.11% vs teste 31.52%,
+overfitting clássico; Busbar Protection com recall 0, 4 arquivos previstos
+como Breaker Failure):
+  E25 - Gap grande entre fitness de validação e de teste -> regularização
+        reforçada em três frentes: (1) dropout da CNN e da célula recorrente
+        agora são parâmetros INDEPENDENTES (`dropout_conv`/`dropout_rnn`, com
+        piso mais alto que o `dropout` único da V2) já que os dois módulos
+        memorizam de formas diferentes; (2) `weight_decay` padrão maior; (3)
+        ruído gaussiano leve injetado no tensor de ENTRADA só durante o
+        treino (nunca em validação/teste), forçando a rede a não decorar o
+        valor exato de cada amostra. Os três (mais `peso_confusao`, ver E26)
+        também entram na busca de hiperparâmetros.
+  E26 - Busbar Protection (classe 2) zerou porque a rede está confundindo-a
+        sistematicamente com Breaker Failure (classe 1) -> a Focal Loss
+        ganhou um termo extra que penaliza especificamente a massa de
+        probabilidade que vaza DENTRO desse par de classes (nos dois
+        sentidos), além do de sempre (pesos por frequência inversa). Isso é
+        mais direcionado do que só aumentar o peso da classe 2, que reduziria
+        falsos negativos de Busbar às custas de mais falsos positivos em
+        QUALQUER outra classe, não só a que ela está de fato confundindo.
 """
 
 # ==============================================================================
@@ -392,7 +413,7 @@ class CamadaVetorizadaBlindada(nn.Module):
 
 class RedeConvTemporal(nn.Module):
     def __init__(self, in_channels, tamanho_janela, arquitetura_ocultas, tamanho_saida,
-                 tamanho_memoria, canais_conv=16, dropout=0.1):
+                 tamanho_memoria, canais_conv=16, dropout_conv=0.25, dropout_rnn=0.30):
         super().__init__()
         self.tamanho_janela = max(3, int(tamanho_janela))
         self.canais_conv = canais_conv
@@ -438,7 +459,11 @@ class RedeConvTemporal(nn.Module):
         # (E6). Normalizando (B*T, C, 1) cada instante usa só os próprios canais.
         grupos = next(g for g in range(min(8, canais_conv), 0, -1) if canais_conv % g == 0)
         self.norm_conv = nn.GroupNorm(grupos, canais_conv)
-        self.dropout_conv = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        # E25: dropout da CNN e da célula recorrente são independentes -- a
+        # CNN decora padrões locais (poucas amostras de contexto), a célula
+        # recorrente decora trajetórias inteiras via `pesos_memoria`; um
+        # único dropout compartilhado (V2) sub-regularizava um dos dois.
+        self.dropout_conv = nn.Dropout(dropout_conv) if dropout_conv > 0 else nn.Identity()
 
         self.ocultas = list(arquitetura_ocultas)
         self.camadas = nn.ModuleList()
@@ -446,7 +471,7 @@ class RedeConvTemporal(nn.Module):
 
         for i, n in enumerate(self.ocultas):
             entradas = canais_conv + sum(self.ocultas[:i]) + sum(self.ocultas)
-            self.camadas.append(CamadaVetorizadaBlindada(n, entradas, tamanho_memoria, dropout=dropout))
+            self.camadas.append(CamadaVetorizadaBlindada(n, entradas, tamanho_memoria, dropout=dropout_rnn))
             largura_anterior = canais_conv if i == 0 else self.ocultas[i - 1]
             self.projecoes.append(
                 nn.Identity() if largura_anterior == n else nn.Linear(largura_anterior, n, bias=False)
@@ -536,18 +561,35 @@ class PerdaFocal(nn.Module):
     aproxima esse peso de zero para exemplos já acertados com confiança e o
     mantém alto para exemplos errados -- concentrando o aprendizado
     justamente nas classes com recall 0.
+
+    E26 - `pares_confusaveis`: pares de classes que a rede troca entre si
+    (ex.: Busbar Protection previsto como Breaker Failure) recebem uma
+    penalidade extra proporcional à probabilidade colocada na classe ERRADA
+    do par, nos dois sentidos. Isso ataca a confusão específica sem inflar o
+    peso da classe inteira (o que penalizaria confundir Busbar com QUALQUER
+    outra classe, não só com Breaker Failure).
     """
-    def __init__(self, pesos_classe, gamma=2.0):
+    def __init__(self, pesos_classe, gamma=2.0, pares_confusaveis=None, peso_confusao=0.5):
         super().__init__()
         self.gamma = gamma
+        self.peso_confusao = peso_confusao
+        self.pares_confusaveis = list(pares_confusaveis or [])
         self.register_buffer("pesos", torch.tensor(pesos_classe, dtype=torch.float32))
 
     def forward(self, logits, alvo):
         log_p = F.log_softmax(logits, dim=-1)
+        prob = log_p.exp()
         log_pt = log_p.gather(1, alvo.unsqueeze(1)).squeeze(1)
         pt = log_pt.exp()
         peso_t = self.pesos[alvo]
         perda = -peso_t * (1 - pt) ** self.gamma * log_pt
+
+        for a, b in self.pares_confusaveis:
+            mascara_a = (alvo == a)
+            mascara_b = (alvo == b)
+            perda = perda + self.peso_confusao * mascara_a * prob[:, b]
+            perda = perda + self.peso_confusao * mascara_b * prob[:, a]
+
         return perda.mean()
 
 
@@ -571,13 +613,21 @@ def montar_lotes(dados, tamanho_lote, embaralhar=True, seed=None):
     return lotes
 
 
-def passar_lote(rede, x, y, criterio, otimizador, tamanho_bloco, treinar):
+def passar_lote(rede, x, y, criterio, otimizador, tamanho_bloco, treinar, ruido_treino=0.0):
     """
     Percorre um lote de arquivos com TBPTT em blocos de `tamanho_bloco`.
     Retorna (loss_média, logits (T, B, C) destacados).
     """
     B, T, _ = x.shape
     rede.resetar_estados(B, x.device)
+
+    if treinar and ruido_treino > 0:
+        # E25: ruído gaussiano leve só no treino (nunca em validação/teste,
+        # `treinar=False` nessas chamadas) -- data augmentation simples que
+        # impede a rede de decorar o valor exato de cada amostra. O
+        # RobustScaler já deixa a maior parte das features em escala ~1,
+        # então um sigma pequeno é uma perturbação real sem apagar o sinal.
+        x = x + torch.randn_like(x) * ruido_treino
 
     # E6/E16: no original a CNN via blocos de 60 no treino (com zero-padding
     # dominando um kernel de 21) e o arquivo inteiro na inferência -> features
@@ -629,7 +679,9 @@ def treinar_rede(config, dados_treino, num_features, epocas, pesos_classe,
     fixar_seed(seed)
     rede = RedeConvTemporal(
         num_features, config["tamanho_janela"], config["arquitetura"],
-        tamanho_saida, config["memoria"], dropout=config.get("dropout", 0.15)
+        tamanho_saida, config["memoria"],
+        dropout_conv=config.get("dropout_conv", 0.25),
+        dropout_rnn=config.get("dropout_rnn", 0.30),
     ).to(device)
 
     # E23: AdamW (weight_decay desacoplado do gradiente, ao contrário do
@@ -637,12 +689,21 @@ def treinar_rede(config, dados_treino, num_features, epocas, pesos_classe,
     # treino de 53 arquivos, converge cedo para um mínimo raso que já
     # "resolve" a maioria das classes majoritárias e para de melhorar --
     # exatamente a loss estagnada em ~1.05 relatada.
+    # E25: piso de weight_decay mais alto que a V2 -- o gap fitness
+    # val (62.11%) vs teste (31.52%) era overfitting clássico.
     otimizador = optim.AdamW(
         rede.parameters(), lr=config["lr"],
-        weight_decay=config.get("weight_decay", 1e-4),
+        weight_decay=config.get("weight_decay", 3e-4),
     )
     scheduler = optim.lr_scheduler.CosineAnnealingLR(otimizador, T_max=max(epocas, 1))
-    criterio = PerdaFocal(pesos_classe, gamma=2.0).to(device)
+    # E26: par (Breaker Failure, Busbar Protection) penalizado explicitamente
+    # -- era a confusão observada na V2 (4 Busbar previstos como Breaker).
+    criterio = PerdaFocal(
+        pesos_classe, gamma=2.0,
+        pares_confusaveis=[(1, 2)],
+        peso_confusao=config.get("peso_confusao", 0.5),
+    ).to(device)
+    ruido_treino = config.get("ruido_treino", 0.03)
 
     # E24: checkpoint dos pesos com melhor FITNESS em validação. Sem isso o
     # modelo devolvido é o da última época, mesmo que o treino tenha
@@ -655,7 +716,8 @@ def treinar_rede(config, dados_treino, num_features, epocas, pesos_classe,
     for epoca in range(epocas):
         rede.train()
         lotes = montar_lotes(dados_treino, lote_arquivos, True, seed + epoca)
-        perdas = [passar_lote(rede, x, y, criterio, otimizador, tamanho_bloco, True)[0]
+        perdas = [passar_lote(rede, x, y, criterio, otimizador, tamanho_bloco, True,
+                              ruido_treino=ruido_treino)[0]
                   for x, y in lotes]
         loss_ep = float(np.mean(perdas))
         historico.append(loss_ep)
@@ -750,6 +812,18 @@ def gerar_variacao(base, intensidade, janela_max=31):
         nova["weight_decay"] * random.uniform(1 - intensidade, 1 + intensidade), 1e-6, 1e-2))
     delta_mem = int(nova["memoria"] * intensidade)
     nova["memoria"] = int(np.clip(nova["memoria"] + random.randint(-delta_mem, delta_mem), 10, 150))
+
+    # E25: dropout_conv/dropout_rnn/ruido_treino também sob busca -- o piso
+    # mais alto da V3 é um chute inicial, não um ótimo conhecido.
+    nova["dropout_conv"] = float(np.clip(
+        nova["dropout_conv"] + random.uniform(-intensidade, intensidade) * 0.3, 0.05, 0.6))
+    nova["dropout_rnn"] = float(np.clip(
+        nova["dropout_rnn"] + random.uniform(-intensidade, intensidade) * 0.3, 0.05, 0.6))
+    nova["ruido_treino"] = float(np.clip(
+        nova["ruido_treino"] * random.uniform(1 - intensidade, 1 + intensidade), 0.0, 0.15))
+    # E26: intensidade da penalidade de confusão Breaker/Busbar também sob busca.
+    nova["peso_confusao"] = float(np.clip(
+        nova["peso_confusao"] * random.uniform(1 - intensidade, 1 + intensidade), 0.0, 2.0))
 
     if random.random() < intensidade:
         nova["tamanho_janela"] = int(np.clip(
@@ -920,15 +994,18 @@ if __name__ == "__main__":
     # E23: uma camada oculta a mais ([32, 64, 64, 32], antes [32, 64, 32]) --
     # a rede antiga não tinha capacidade sobrando para separar 4 classes com
     # recall 0 em duas delas. O risco de overfit nesse dataset pequeno (53
-    # arquivos de treino) é compensado por weight_decay + dropout, ambos sob
-    # busca de hiperparâmetros junto com o resto.
+    # arquivos de treino) é compensado por weight_decay + dropout + ruído de
+    # treino (E25), todos sob busca de hiperparâmetros junto com o resto.
     config_inicial = {
         "arquitetura": [32, 64, 64, 32],
         "memoria": 60,
         "lr": 0.001,
         "tamanho_janela": 21,
-        "weight_decay": 1e-4,
-        "dropout": 0.15,
+        "weight_decay": 3e-4,     # E25: piso mais alto que a V2 (1e-4)
+        "dropout_conv": 0.25,     # E25: antes um único "dropout": 0.15
+        "dropout_rnn": 0.30,      # E25: célula recorrente sofre mais overfit
+        "ruido_treino": 0.03,     # E25: ruído gaussiano leve só no treino
+        "peso_confusao": 0.5,     # E26: penalidade extra Breaker <-> Busbar
     }
 
     config_campea, _ = buscar_configuracao(
