@@ -37,6 +37,32 @@ Melhorias de arquitetura aplicadas nesta revisão (RedeConvTemporal / CamadaVeto
   E19 - GPU (Colab T4/A100 etc.): cuDNN benchmark + TF32 habilitados quando
         `device == "cuda"`; toda a rede permanece 100% device-agnostic
         (nenhum `.cuda()` hardcoded, tudo segue o device do tensor de entrada).
+
+Correções aplicadas nesta revisão (Fitness 20.00% / Accuracy 38.9%, recall 0
+em "Breaker Failure" e "Under Frequency", loss estagnada em ~1.05):
+  E20 - 'circuit breaker mechanical failure_delta' é constante em todo o
+        dataset (std=0.0, `diagnosticar_separabilidade` só avisava, não
+        agia) -> removida junto com qualquer outra coluna sem variância no
+        TREINO, de forma genérica (sem hardcode de nome de coluna).
+  E21 - CrossEntropyLoss com pesos de classe trata todo exemplo igual
+        independente de quão errado o modelo já está; numa rede que colapsa
+        para 1-2 classes, a maioria do gradiente vem de exemplos já fáceis
+        -> Focal Loss ponderada (fator (1-p)^gamma), que concentra o
+        gradiente nos exemplos difíceis -- exatamente as classes ignoradas.
+  E22 - Todas as features entravam na CNN em pé de igualdade, mesmo com
+        separabilidade (ANOVA F) muito diferente entre elas (frequency
+        F=3.11 vs correntes F~1) -> ganho de entrada aprendível por canal,
+        para a própria rede amplificar as features mais separáveis via
+        gradiente, em vez de depender só da escala do RobustScaler.
+  E23 - Adam sem weight_decay e sem scheduler, num dataset de 53 arquivos de
+        treino, converge rápido para um mínimo raso que ignora as classes
+        minoritárias -> AdamW com weight_decay (também sob busca de
+        hiperparâmetros) + CosineAnnealingLR.
+  E24 - O treino final usava os pesos da ÚLTIMA época mesmo quando o F1
+        macro em validação era MELHOR em épocas anteriores (ex.: 0.600 na
+        época 25 vs 0.496 na época 40, a que efetivamente ia para o teste)
+        -> checkpoint dos pesos com melhor fitness em validação, restaurado
+        ao final do treino.
 """
 
 # ==============================================================================
@@ -229,6 +255,22 @@ def preparar_dados_reais(caminho_zip, pasta_destino, test_size=0.20, val_size=0.
         c = collections.Counter(r for _, r in conj)
         print(f"    {nome:7s}: {[c.get(i, 0) for i in range(TAMANHO_SAIDA)]}")
 
+    # ---- E20: remover colunas constantes no TREINO -------------------------
+    # Uma coluna sem variância não carrega informação -- só ruído e parâmetros
+    # a mais. Decidido a partir do treino (nunca de val/teste) para não
+    # vazar estatística, e aplicado às três partições pelos mesmos índices.
+    desvios_treino = np.vstack([s for s, _ in treino]).std(axis=0)
+    manter = np.where(desvios_treino > 1e-6)[0]
+    removidas = [nomes_finais[i] for i in range(len(nomes_finais)) if i not in manter]
+    if removidas:
+        print(f"\n[OK] Colunas constantes removidas do pré-processamento: {removidas}")
+    nomes_finais = [nomes_finais[i] for i in manter]
+
+    def filtrar_colunas(lista):
+        return [(s[:, manter], r) for s, r in lista]
+
+    treino, val, teste = filtrar_colunas(treino), filtrar_colunas(val), filtrar_colunas(teste)
+
     # ---- normalização: ajustada SÓ no treino ------------------------------
     scaler = RobustScaler()
     scaler.fit(np.vstack([s for s, _ in treino]))
@@ -355,6 +397,15 @@ class RedeConvTemporal(nn.Module):
         self.tamanho_janela = max(3, int(tamanho_janela))
         self.canais_conv = canais_conv
 
+        # E22: ganho de entrada aprendível, um escalar por feature. As
+        # colunas chegam do RobustScaler todas com a MESMA escala de
+        # variância, mas não com a mesma SEPARABILIDADE entre classes (ex.:
+        # "frequency" tem F-ANOVA=3.11, "current line 'l1'" tem F~1). Sem
+        # isso a rede tem que aprender essa relevância inteira dentro dos
+        # pesos da primeira convolução; com isso, o gradiente pode amplificar
+        # diretamente o canal mais informativo antes de qualquer conv/RNN.
+        self.ganho_entrada = nn.Parameter(torch.ones(in_channels))
+
         # E15/E16: banco de convoluções CAUSAIS em 3 escalas de tempo.
         # Curta  -> transitórios rápidos (falha de disjuntor).
         # Média  -> a janela configurada (busca de hiperparâmetros).
@@ -430,6 +481,7 @@ class RedeConvTemporal(nn.Module):
         TBPTT em blocos (`passar_lote`) para reproduzir exatamente a mesma
         convolução causal que seria obtida rodando o arquivo inteiro de uma vez.
         """
+        x_com_contexto = x_com_contexto * self.ganho_entrada.view(1, -1, 1)
         max_ctx = self.contexto_necessario
         saidas = []
         for conv, k in zip(self.ramos_conv, self.escalas):
@@ -474,6 +526,31 @@ class RedeConvTemporal(nn.Module):
 # ==============================================================================
 # CÉLULA 4: TREINO E AVALIAÇÃO
 # ==============================================================================
+class PerdaFocal(nn.Module):
+    """
+    E21: CrossEntropyLoss (mesmo com pesos de classe) dá o mesmo peso de
+    gradiente a um exemplo já bem classificado e a um exemplo que a rede
+    erra feio. Numa rede que colapsa para prever só 1-2 classes, a maioria
+    dos exemplos "fáceis" pertence às classes majoritárias e domina o
+    gradiente médio, afogando as classes raras. O fator (1 - p_alvo)^gamma
+    aproxima esse peso de zero para exemplos já acertados com confiança e o
+    mantém alto para exemplos errados -- concentrando o aprendizado
+    justamente nas classes com recall 0.
+    """
+    def __init__(self, pesos_classe, gamma=2.0):
+        super().__init__()
+        self.gamma = gamma
+        self.register_buffer("pesos", torch.tensor(pesos_classe, dtype=torch.float32))
+
+    def forward(self, logits, alvo):
+        log_p = F.log_softmax(logits, dim=-1)
+        log_pt = log_p.gather(1, alvo.unsqueeze(1)).squeeze(1)
+        pt = log_pt.exp()
+        peso_t = self.pesos[alvo]
+        perda = -peso_t * (1 - pt) ** self.gamma * log_pt
+        return perda.mean()
+
+
 def montar_lotes(dados, tamanho_lote, embaralhar=True, seed=None):
     """
     E4: cada elemento do lote é UM ARQUIVO INTEIRO (600 passos), não um pedaço
@@ -548,17 +625,31 @@ def passar_lote(rede, x, y, criterio, otimizador, tamanho_bloco, treinar):
 def treinar_rede(config, dados_treino, num_features, epocas, pesos_classe,
                  tamanho_saida=TAMANHO_SAIDA, tamanho_bloco=TAMANHO_BLOCO,
                  lote_arquivos=LOTE_ARQUIVOS, silencioso=True, seed=SEED,
-                 dados_val=None):
+                 dados_val=None, avaliar_a_cada=5):
     fixar_seed(seed)
     rede = RedeConvTemporal(
         num_features, config["tamanho_janela"], config["arquitetura"],
-        tamanho_saida, config["memoria"]
+        tamanho_saida, config["memoria"], dropout=config.get("dropout", 0.15)
     ).to(device)
 
-    otimizador = optim.Adam(rede.parameters(), lr=config["lr"])
-    criterio = nn.CrossEntropyLoss(
-        weight=torch.tensor(pesos_classe, dtype=torch.float32, device=device)
+    # E23: AdamW (weight_decay desacoplado do gradiente, ao contrário do
+    # Adam+L2 clássico) + cosseno decrescente. Sem isso o Adam puro, num
+    # treino de 53 arquivos, converge cedo para um mínimo raso que já
+    # "resolve" a maioria das classes majoritárias e para de melhorar --
+    # exatamente a loss estagnada em ~1.05 relatada.
+    otimizador = optim.AdamW(
+        rede.parameters(), lr=config["lr"],
+        weight_decay=config.get("weight_decay", 1e-4),
     )
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(otimizador, T_max=max(epocas, 1))
+    criterio = PerdaFocal(pesos_classe, gamma=2.0).to(device)
+
+    # E24: checkpoint dos pesos com melhor FITNESS em validação. Sem isso o
+    # modelo devolvido é o da última época, mesmo que o treino tenha
+    # piorado depois de um pico (visto no log: F1-macro val 0.600 na época
+    # 25, caindo para 0.496 na época 40 -- a que ia para o teste).
+    melhor_fitness_val = -1.0
+    melhor_estado = None
 
     historico = []
     for epoca in range(epocas):
@@ -568,13 +659,31 @@ def treinar_rede(config, dados_treino, num_features, epocas, pesos_classe,
                   for x, y in lotes]
         loss_ep = float(np.mean(perdas))
         historico.append(loss_ep)
+        scheduler.step()
+
+        avaliar_agora = dados_val is not None and (
+            (epoca + 1) % avaliar_a_cada == 0 or epoca == epocas - 1
+        )
+        if avaliar_agora:
+            y_v, p_v, _ = prever_arquivos(rede, dados_val, criterio, tamanho_bloco)
+            fit_val = calcular_fitness(y_v, p_v, tamanho_saida)
+            if fit_val > melhor_fitness_val:
+                melhor_fitness_val = fit_val
+                melhor_estado = copy.deepcopy(rede.state_dict())
 
         if not silencioso:
             msg = f"      [Época {epoca + 1}/{epocas}] Loss: {loss_ep:.4f}"
-            if dados_val is not None and (epoca + 1) % 5 == 0:
-                y_v, p_v, _ = prever_arquivos(rede, dados_val, criterio, tamanho_bloco)
-                msg += f" | F1-macro val: {np.mean(f1_por_classe(y_v, p_v, tamanho_saida)):.3f}"
+            if avaliar_agora:
+                msg += (f" | Fitness val: {fit_val * 100:.2f}% "
+                        f"(melhor: {melhor_fitness_val * 100:.2f}%)")
+            msg += f" | lr: {scheduler.get_last_lr()[0]:.5f}"
             print(msg)
+
+    if melhor_estado is not None:
+        rede.load_state_dict(melhor_estado)
+        if not silencioso:
+            print(f"      [OK] Pesos restaurados da melhor época em validação "
+                  f"(fitness {melhor_fitness_val * 100:.2f}%)")
 
     return rede, criterio, historico
 
@@ -634,6 +743,11 @@ def gerar_variacao(base, intensidade, janela_max=31):
 
     nova["lr"] = float(np.clip(nova["lr"] * random.uniform(1 - intensidade, 1 + intensidade),
                                1e-4, 1e-2))
+    # E23: weight_decay também sob busca -- regularização forte demais
+    # (dataset de 53 arquivos) sufoca as classes raras, fraca demais deixa a
+    # rede memorizar a maioria e ignorá-las.
+    nova["weight_decay"] = float(np.clip(
+        nova["weight_decay"] * random.uniform(1 - intensidade, 1 + intensidade), 1e-6, 1e-2))
     delta_mem = int(nova["memoria"] * intensidade)
     nova["memoria"] = int(np.clip(nova["memoria"] + random.randint(-delta_mem, delta_mem), 10, 150))
 
@@ -803,11 +917,18 @@ if __name__ == "__main__":
     print(f"\nPesos de classe (frequência inversa): "
           f"{[round(p, 2) for p in pesos_classe]}")
 
+    # E23: uma camada oculta a mais ([32, 64, 64, 32], antes [32, 64, 32]) --
+    # a rede antiga não tinha capacidade sobrando para separar 4 classes com
+    # recall 0 em duas delas. O risco de overfit nesse dataset pequeno (53
+    # arquivos de treino) é compensado por weight_decay + dropout, ambos sob
+    # busca de hiperparâmetros junto com o resto.
     config_inicial = {
-        "arquitetura": [32, 64, 32],
+        "arquitetura": [32, 64, 64, 32],
         "memoria": 60,
         "lr": 0.001,
         "tamanho_janela": 21,
+        "weight_decay": 1e-4,
+        "dropout": 0.15,
     }
 
     config_campea, _ = buscar_configuracao(
