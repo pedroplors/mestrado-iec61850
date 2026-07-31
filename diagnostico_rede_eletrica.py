@@ -114,6 +114,34 @@ absorvendo todo o Busbar Protection e derrubando a precisão de Breaker para
         que já concentra a maior parte da capacidade de memorização via
         `pesos_memoria`. dropout_conv/dropout_rnn/ruido_treino (E25)
         continuam como estavam.
+
+Correções aplicadas nesta revisão (V4 — Fitness caiu para 30.48%, de volta ao
+patamar pré-V3; Breaker Failure e Busbar Protection voltaram a recall 0):
+  E29 - A troca da Focal Loss por CrossEntropy+label smoothing (E27) e a
+        redução da arquitetura para 3 camadas (E28) foram longe demais na
+        direção oposta: sem o termo dinâmico (1-pt)^gamma a rede voltou a
+        ignorar as classes raras (o problema original que a Focal Loss
+        existia para resolver), e a camada removida tirou capacidade que a
+        rede efetivamente usava (V3 é a campeã em fitness de teste, 39.77%
+        vs 30.48% da V4). Configuração MESTRE, combinando o que funcionou em
+        cada versão em vez de trocar um mecanismo pelo outro:
+          (a) arquitetura de volta a [32, 64, 64, 32] (a da V3/E23);
+          (b) Focal Loss de volta (E21/E26), mas com `gamma` reduzido de 2.0
+              para 1.5 -- o fator dinâmico continua concentrando gradiente
+              nos exemplos difíceis, só que multiplica o peso da classe rara
+              com menos força, já que ESSE era o mecanismo apontado (E27)
+              como causa do viés para prever Breaker Failure demais; o
+              `peso_confusao` do par (Breaker, Busbar) também cai de 0.5
+              para 0.3 pelo mesmo motivo, mantendo o mecanismo mas com menos
+              agressividade. Ambos continuam sob busca de hiperparâmetros;
+          (c) dropout_conv/dropout_rnn independentes e ruído gaussiano de
+              treino (E25) mantidos como estavam -- nenhuma das duas versões
+              apontou esses dois como causa de problema;
+          (d) treino final estendido de 40 para 60 épocas -- com a
+              arquitetura maior de volta e o CosineAnnealingLR calculado
+              sobre `epocas`, um treino mais longo dá tempo do LR terminar
+              de decair e da rede efetivamente assentar nas classes raras
+              antes do checkpoint de melhor fitness (E24) fixar os pesos.
 """
 
 # ==============================================================================
@@ -581,36 +609,54 @@ class RedeConvTemporal(nn.Module):
 # ==============================================================================
 # CÉLULA 4: TREINO E AVALIAÇÃO
 # ==============================================================================
-class PerdaSuavizada(nn.Module):
+class PerdaFocal(nn.Module):
     """
-    E27: substitui a Focal Loss (E21/E26). O fator dinâmico (1-pt)^gamma da
-    focal multiplicava o peso -- já alto -- da classe mais rara toda vez que
-    a rede estava incerta, o que na prática empurrava a rede a "chutar"
-    aquela classe sempre que a confiança era baixa (foi o que aconteceu com
-    Breaker Failure, que passou a absorver Busbar Protection inteiro). Uma
-    CrossEntropyLoss padrão não tem esse termo dinâmico, e o label smoothing
-    (suaviza o alvo one-hot: 1-smoothing na classe certa, smoothing/(C-1) nas
-    demais) já desincentiva apostas de probabilidade extremas sem precisar
-    reponderar exemplo a exemplo.
+    E21: CrossEntropyLoss (mesmo com pesos de classe) dá o mesmo peso de
+    gradiente a um exemplo já bem classificado e a um exemplo que a rede
+    erra feio. Numa rede que colapsa para prever só 1-2 classes, a maioria
+    dos exemplos "fáceis" pertence às classes majoritárias e domina o
+    gradiente médio, afogando as classes raras. O fator (1 - p_alvo)^gamma
+    aproxima esse peso de zero para exemplos já acertados com confiança e o
+    mantém alto para exemplos errados -- concentrando o aprendizado
+    justamente nas classes com recall 0.
 
-    Os pesos de classe por frequência inversa (E8) continuam, mas agora com
-    TETO: nenhuma classe pode pesar mais que `peso_max_relativo` vezes o
-    peso da classe MAIS FREQUENTE (sempre a de menor peso, tipicamente
-    Normal). Isso limita o quanto uma classe minoritária pode, sozinha,
-    dominar o gradiente médio -- a causa raiz do viés observado.
+    E26 - `pares_confusaveis`: pares de classes que a rede troca entre si
+    (ex.: Busbar Protection previsto como Breaker Failure) recebem uma
+    penalidade extra proporcional à probabilidade colocada na classe ERRADA
+    do par, nos dois sentidos. Isso ataca a confusão específica sem inflar o
+    peso da classe inteira (o que penalizaria confundir Busbar com QUALQUER
+    outra classe, não só com Breaker Failure).
+
+    E29 - a V4 removeu esta loss inteira porque `gamma=2.0` MULTIPLICAVA o
+    peso já alto de Breaker Failure toda vez que a rede estava incerta,
+    incentivando a rede a "chutar" essa classe -- mas a V4 também zerou o
+    recall de Breaker Failure e Busbar Protection ao tirar o mecanismo. O
+    ajuste correto é reduzir a agressividade, não remover: `gamma` (padrão
+    1.5, era 2.0) e `peso_confusao` (padrão 0.3, era 0.5) continuam ativos,
+    só que mais fracos, e ambos seguem sob busca de hiperparâmetros.
     """
-    def __init__(self, pesos_classe, label_smoothing=0.1, peso_max_relativo=4.0):
+    def __init__(self, pesos_classe, gamma=1.5, pares_confusaveis=None, peso_confusao=0.3):
         super().__init__()
-        pesos = np.asarray(pesos_classe, dtype=np.float32)
-        teto = pesos.min() * peso_max_relativo
-        pesos_limitados = np.minimum(pesos, teto)
-        self.register_buffer("pesos", torch.tensor(pesos_limitados, dtype=torch.float32))
-        self.label_smoothing = label_smoothing
+        self.gamma = gamma
+        self.peso_confusao = peso_confusao
+        self.pares_confusaveis = list(pares_confusaveis or [])
+        self.register_buffer("pesos", torch.tensor(pesos_classe, dtype=torch.float32))
 
     def forward(self, logits, alvo):
-        return F.cross_entropy(
-            logits, alvo, weight=self.pesos, label_smoothing=self.label_smoothing
-        )
+        log_p = F.log_softmax(logits, dim=-1)
+        prob = log_p.exp()
+        log_pt = log_p.gather(1, alvo.unsqueeze(1)).squeeze(1)
+        pt = log_pt.exp()
+        peso_t = self.pesos[alvo]
+        perda = -peso_t * (1 - pt) ** self.gamma * log_pt
+
+        for a, b in self.pares_confusaveis:
+            mascara_a = (alvo == a)
+            mascara_b = (alvo == b)
+            perda = perda + self.peso_confusao * mascara_a * prob[:, b]
+            perda = perda + self.peso_confusao * mascara_b * prob[:, a]
+
+        return perda.mean()
 
 
 def montar_lotes(dados, tamanho_lote, embaralhar=True, seed=None):
@@ -716,12 +762,13 @@ def treinar_rede(config, dados_treino, num_features, epocas, pesos_classe,
         weight_decay=config.get("weight_decay", 3e-4),
     )
     scheduler = optim.lr_scheduler.CosineAnnealingLR(otimizador, T_max=max(epocas, 1))
-    # E27: CrossEntropy + label smoothing, com teto no peso de classe --
-    # troca a Focal Loss (V3) para não amplificar a classe mais rara.
-    criterio = PerdaSuavizada(
+    # E29: Focal Loss de volta (E21/E26), com gamma e peso_confusao reduzidos
+    # em relação à V3 -- ver PerdaFocal para o raciocínio completo.
+    criterio = PerdaFocal(
         pesos_classe,
-        label_smoothing=config.get("label_smoothing", 0.1),
-        peso_max_relativo=config.get("peso_max_relativo", 4.0),
+        gamma=config.get("gamma", 1.5),
+        pares_confusaveis=[(1, 2)],
+        peso_confusao=config.get("peso_confusao", 0.3),
     ).to(device)
     ruido_treino = config.get("ruido_treino", 0.03)
 
@@ -841,11 +888,13 @@ def gerar_variacao(base, intensidade, janela_max=31):
         nova["dropout_rnn"] + random.uniform(-intensidade, intensidade) * 0.3, 0.05, 0.6))
     nova["ruido_treino"] = float(np.clip(
         nova["ruido_treino"] * random.uniform(1 - intensidade, 1 + intensidade), 0.0, 0.15))
-    # E27: label smoothing e teto de peso de classe também sob busca.
-    nova["label_smoothing"] = float(np.clip(
-        nova["label_smoothing"] + random.uniform(-intensidade, intensidade) * 0.2, 0.0, 0.3))
-    nova["peso_max_relativo"] = float(np.clip(
-        nova["peso_max_relativo"] * random.uniform(1 - intensidade, 1 + intensidade), 1.5, 8.0))
+    # E29: gamma da focal e peso_confusao do par (Breaker, Busbar) também sob
+    # busca -- os padrões (1.5 / 0.3) são um chute deliberadamente mais fraco
+    # que a V3 (2.0 / 0.5), não um ótimo conhecido.
+    nova["gamma"] = float(np.clip(
+        nova["gamma"] * random.uniform(1 - intensidade, 1 + intensidade), 0.5, 3.0))
+    nova["peso_confusao"] = float(np.clip(
+        nova["peso_confusao"] * random.uniform(1 - intensidade, 1 + intensidade), 0.0, 1.0))
 
     if random.random() < intensidade:
         nova["tamanho_janela"] = int(np.clip(
@@ -1013,22 +1062,22 @@ if __name__ == "__main__":
     print(f"\nPesos de classe (frequência inversa): "
           f"{[round(p, 2) for p in pesos_classe]}")
 
-    # E28: de volta a 3 camadas ocultas ([32, 64, 32], a V3 tinha [32, 64, 64,
-    # 32]) -- com o teto de peso de classe (E27) deixando o gradiente mais
-    # equilibrado, a camada extra da V3 sobrava capacidade para decorar
-    # ruído fino em vez do padrão da falha. weight_decay + dropout + ruído
-    # de treino (E25) continuam, todos sob busca de hiperparâmetros.
+    # E29: configuração MESTRE -- arquitetura de volta a 4 camadas ocultas
+    # ([32, 64, 64, 32], a da V3/E23, a campeã em fitness de teste até aqui);
+    # gamma/peso_confusao da Focal Loss (PerdaFocal) reduzidos em relação à
+    # V3 para não repetir o viés de sobre-previsão de Breaker Failure; e
+    # dropout_conv/dropout_rnn/ruído de treino (E25) mantidos como estavam.
     config_inicial = {
-        "arquitetura": [32, 64, 32],
+        "arquitetura": [32, 64, 64, 32],
         "memoria": 60,
         "lr": 0.001,
         "tamanho_janela": 21,
-        "weight_decay": 3e-4,       # E25: piso mais alto que a V2 (1e-4)
-        "dropout_conv": 0.25,       # E25: antes um único "dropout": 0.15
-        "dropout_rnn": 0.30,        # E25: célula recorrente sofre mais overfit
-        "ruido_treino": 0.03,       # E25: ruído gaussiano leve só no treino
-        "label_smoothing": 0.1,     # E27: substitui a Focal Loss (V3)
-        "peso_max_relativo": 4.0,   # E27: teto do peso da classe mais rara
+        "weight_decay": 3e-4,      # E25: piso mais alto que a V2 (1e-4)
+        "dropout_conv": 0.25,      # E25: antes um único "dropout": 0.15
+        "dropout_rnn": 0.30,       # E25: célula recorrente sofre mais overfit
+        "ruido_treino": 0.03,      # E25: ruído gaussiano leve só no treino
+        "gamma": 1.5,              # E29: focal de volta, menos agressiva que a V3 (2.0)
+        "peso_confusao": 0.3,      # E29: idem para o par Breaker/Busbar (V3: 0.5)
     }
 
     config_campea, _ = buscar_configuracao(
@@ -1037,11 +1086,11 @@ if __name__ == "__main__":
     )
 
     print("\n" + "=" * 62)
-    print(" TREINO FINAL (treino + validação, 40 épocas)")
+    print(" TREINO FINAL (treino + validação, 60 épocas)")
     print("=" * 62)
     rede_final, criterio_final, hist = treinar_rede(
         config_campea, dados_treino + dados_val, NUM_FEATURES,
-        epocas=40, pesos_classe=pesos_classe, silencioso=False, dados_val=dados_val,
+        epocas=60, pesos_classe=pesos_classe, silencioso=False, dados_val=dados_val,
     )
 
     relatorio_final(rede_final, criterio_final, dados_teste, "TESTE")
