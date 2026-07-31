@@ -142,6 +142,29 @@ patamar pré-V3; Breaker Failure e Busbar Protection voltaram a recall 0):
               sobre `epocas`, um treino mais longo dá tempo do LR terminar
               de decair e da rede efetivamente assentar nas classes raras
               antes do checkpoint de melhor fitness (E24) fixar os pesos.
+
+Migração de dataset (V6 — DATASET-MESTRADO -> DATASET-CYBERATTACK):
+  E30 - Troca completa de domínio: o dataset IEC61850 original (grandezas
+        elétricas: corrente, tensão, frequência, status de disjuntor; 4
+        classes de falha) dá lugar ao dataset de ataques cibernéticos
+        (telemetria GOOSE; 2 classes: Normal/Data Manipulation).
+        Ajustes necessários, todos genéricos (nenhum hardcode de nome de
+        classe além dos dois novos rótulos):
+          - `CAMINHO_ZIP`/`PASTA_EXTRAIDA` apontam para o novo .zip;
+          - `MAPA_CLASSES`/`NOMES_CLASSES`/`TAMANHO_SAIDA` reduzidos às 2
+            classes reais do novo dataset;
+          - `COLUNAS_FISICAS` (grandezas elétricas antigas) virou
+            `COLUNAS_ESPERADAS`, com os 19 nomes exatos do novo esquema;
+            o `input_size` da CNN (`num_features`) já era calculado
+            dinamicamente a partir das colunas sobreviventes (base + delta
+            - constantes no treino), então recalcula sozinho a partir da
+            nova lista, sem alteração estrutural;
+          - `pares_confusaveis=[(1, 2)]` (par Breaker/Busbar, específico do
+            dataset antigo de 4 classes) removido da Focal Loss -- com só 2
+            classes não existe um terceiro par a confundir;
+          - `plotar_reacao`: paleta de cores reduzida a 2 classes e a busca
+            pela coluna de "voltage" (inexistente no novo esquema) trocada
+            pela corrente do disjuntor CB1-66KV como sinal de referência.
 """
 
 # ==============================================================================
@@ -199,27 +222,30 @@ if device == "cuda":
     torch.set_float32_matmul_precision("high")
     print(f"    GPU: {torch.cuda.get_device_name(0)}")
 
-CAMINHO_ZIP = "/content/DATASET-MESTRADO.zip" if os.path.exists("/content/DATASET-MESTRADO.zip") else os.path.abspath("DATASET-MESTRADO.zip")
-PASTA_EXTRAIDA = "/content/dataset_iec61850" if os.path.exists("/content") else os.path.abspath("dataset_iec61850")
+CAMINHO_ZIP = "/content/DATASET-CYBERATTACK.zip" if os.path.exists("/content/DATASET-CYBERATTACK.zip") else os.path.abspath("DATASET-CYBERATTACK.zip")
+PASTA_EXTRAIDA = "/content/dataset_cyberattack" if os.path.exists("/content") else os.path.abspath("dataset_cyberattack")
 
-TAMANHO_SAIDA = 4
+TAMANHO_SAIDA = 2
 LOTE_ARQUIVOS = 8      # E4: o lote agora é de ARQUIVOS, não de pedaços de um arquivo
 TAMANHO_BLOCO = 100    # E4/E5: TBPTT ao longo do tempo REAL do arquivo
 
 MAPA_CLASSES = {
     "normal": 0,
-    "breaker failure": 1,
-    "busbar protection": 2,
-    "under frequency": 3,
+    "data manipulation": 1,
 }
-NOMES_CLASSES = {0: "Normal", 1: "Breaker Failure", 2: "Busbar Protection", 3: "Under Frequency"}
+NOMES_CLASSES = {0: "Normal", 1: "Data Manipulation"}
 
-COLUNAS_FISICAS = [
-    "current line 'l1'", "current line 'l2'", "current line 'l3'",
-    "voltage phase 'l1-n'", "voltage phase 'l2-n'", "voltage phase 'l3-n'",
-    "frequency",
-    "circuit breaker open/close status",
-    "circuit breaker mechanical failure",
+# E30: dataset trocado de IEC61850 (grandezas elétricas) para o de ataques
+# cibernéticos (DATASET-CYBERATTACK) -- colunas físicas antigas (corrente,
+# tensão, frequência, status de disjuntor) não existem mais; o novo esquema
+# é numérico de status/telemetria do protocolo GOOSE, com nomes EXATOS
+# (preservados aqui como estão no CSV; a comparação com `df.columns`, que
+# chega em minúsculas, é feita em minúsculas mais abaixo).
+COLUNAS_ESPERADAS = [
+    "stNum", "sqNum", "I_CB1-66KV", "I_CB2-66KV", "I_CB3-66KV",
+    "I_TRSF1-W1", "I_TRSF1-W2", "I_CB-TRSF1", "I_TRSF2-W1", "I_TRSF2-W2",
+    "I_CB-TRSF2", "I_CB2-22KV", "I_FDR1", "I_FDR2", "I_FDR3", "I_FDR4",
+    "Status_CB1-22KV", "Status_CB3-22KV", "Status_CB-FDR1", "Status_CB-FDR4",
 ]
 
 
@@ -279,7 +305,8 @@ def preparar_dados_reais(caminho_zip, pasta_destino, test_size=0.20, val_size=0.
             auditoria["vazios"].append(os.path.basename(arquivo))
             continue
 
-        faltantes = [c for c in COLUNAS_FISICAS if c not in df.columns]
+        colunas_esperadas_lower = [c.lower() for c in COLUNAS_ESPERADAS]
+        faltantes = [c for c in colunas_esperadas_lower if c not in df.columns]
         if faltantes:
             # E12: preencher com 0.0 é fabricar sensor. Continua sendo feito,
             # mas agora aparece no relatório para você decidir se descarta.
@@ -289,7 +316,7 @@ def preparar_dados_reais(caminho_zip, pasta_destino, test_size=0.20, val_size=0.
             for c in faltantes:
                 df[c] = 0.0
 
-        df_fis = df[COLUNAS_FISICAS].copy()
+        df_fis = df[colunas_esperadas_lower].copy()
         df_fis = df_fis.astype(str).apply(lambda x: x.str.replace(",", ".").str.strip())
         df_num = df_fis.apply(pd.to_numeric, errors="coerce").fillna(0.0)
 
@@ -764,10 +791,14 @@ def treinar_rede(config, dados_treino, num_features, epocas, pesos_classe,
     scheduler = optim.lr_scheduler.CosineAnnealingLR(otimizador, T_max=max(epocas, 1))
     # E29: Focal Loss de volta (E21/E26), com gamma e peso_confusao reduzidos
     # em relação à V3 -- ver PerdaFocal para o raciocínio completo.
+    # E30: `pares_confusaveis` do par (Breaker, Busbar) removido -- o dataset
+    # de ataques cibernéticos tem só 2 classes (Normal/Data Manipulation),
+    # não existe um terceiro par de classes minoritárias a confundir entre
+    # si; a Focal Loss por si só já cobre o desbalanceamento binário.
     criterio = PerdaFocal(
         pesos_classe,
         gamma=config.get("gamma", 1.5),
-        pares_confusaveis=[(1, 2)],
+        pares_confusaveis=None,
         peso_confusao=config.get("peso_confusao", 0.3),
     ).to(device)
     ruido_treino = config.get("ruido_treino", 0.03)
@@ -1005,11 +1036,15 @@ def plotar_reacao(rede, dados, nomes_colunas, indice=0):
     logits = torch.stack([rede.forward_rnn(feats[:, :, t]) for t in range(x.shape[1])], dim=0)
     probs = F.softmax(logits.squeeze(1), dim=-1).cpu().numpy()   # (T, C)
 
+    # E30: não há mais colunas de tensão/corrente elétrica nomeadas -- o
+    # dataset de ataques cibernéticos usa telemetria GOOSE. Plota a corrente
+    # do disjuntor CB1-66KV (primeira coluna física da lista, sem o delta)
+    # como sinal de referência.
     idx = next((i for i, c in enumerate(nomes_colunas)
-                if "voltage" in c and "l1" in c and "delta" not in c), 0)
+                if "i_cb1-66kv" in c and "delta" not in c), 0)
     serie = sinal[:, idx].cpu().numpy()
 
-    cores = {0: "green", 1: "orange", 2: "purple", 3: "red"}
+    cores = {0: "green", 1: "red"}
     fig, axes = plt.subplots(1, 2, figsize=(15, 4))
 
     axes[0].plot(serie, color="black", lw=0.6)
