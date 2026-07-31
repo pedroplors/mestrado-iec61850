@@ -165,6 +165,45 @@ Migração de dataset (V6 — DATASET-MESTRADO -> DATASET-CYBERATTACK):
           - `plotar_reacao`: paleta de cores reduzida a 2 classes e a busca
             pela coluna de "voltage" (inexistente no novo esquema) trocada
             pela corrente do disjuntor CB1-66KV como sinal de referência.
+
+Iteração Cyber 2 (V7 — Fitness 69.86%, recall Data Manipulation = 1.000
+(0 falsos negativos, excelente), mas recall Normal = 0.375: 5 dos 8 arquivos
+Normal do teste previstos como ataque):
+  E31 - Dois motivos concretos para a rede ignorar o padrão "Normal":
+        (1) `pares_confusaveis` (E26) fica `None` no dataset cyber (E30) --
+            `peso_confusao` continuava sob busca de hiperparâmetros sem
+            NENHUM efeito na loss, então a busca não tinha como atacar essa
+            confusão específica; (2) os pesos de classe por frequência
+            inversa (E8) resultam quase em 1:1 ([0.96, 1.05]) porque o
+            dataset cyber é quase balanceado (39 Normal / 35 Data
+            Manipulation) -- ao contrário do dataset elétrico original
+            (raro/frequente bem separados), aqui frequência inversa não dá
+            nenhum sinal extra para o lado que está de fato errando.
+        Correções, as duas sob busca de hiperparâmetros:
+          (a) `PerdaFocal` ganha um termo assimétrico de falso positivo,
+              independente do mecanismo de par confusível: penaliza
+              especificamente a massa de probabilidade que a rede põe na(s)
+              classe(s) de ataque quando o rótulo verdadeiro é Normal
+              (`classe_normal`), sem tocar no lado Data Manipulation (que já
+              está em 100% de recall -- reforçar esse lado só pioraria o
+              problema). Peso inicial `peso_falso_positivo=0.4`.
+          (b) `boost_normal`: multiplicador aplicado só ao peso de classe do
+              Normal (índice 0) DEPOIS do cálculo por frequência inversa,
+              para compensar o 1:1 quase neutro do item (1) sem mexer no
+              peso da classe Attack. Aplicado dentro de `treinar_rede` (não
+              no `pesos_classe` global) para variar por configuração durante
+              a busca. Padrão inicial 1.4.
+  E32 - Arquitetura ([32, 64, 64, 32], 4 camadas) e dropout (0.25/0.30,
+        pisos da V3 E25) foram calibrados para o dataset elétrico de 4
+        classes com trajetórias longas e ruidosas; no cyber, "Data
+        Manipulation" tem um sinal quase determinístico (`i_cb2-66kv_delta`
+        com F=inf, ver auditoria de separabilidade) e a rede já aprende esse
+        lado perfeitamente -- o gargalo é a borda de decisão do lado Normal,
+        que precisa de mais capacidade para não ser "arrastada" pelo sinal
+        forte do ataque. Arquitetura aprofundada para 5 camadas
+        ([32, 64, 96, 64, 32]) e dropout_conv/dropout_rnn reduzidos
+        (0.25->0.15 / 0.30->0.20) para a rede memorizar mais dessa borda em
+        vez de ser podada antes de aprendê-la. Ambos continuam sob busca.
 """
 
 # ==============================================================================
@@ -661,12 +700,24 @@ class PerdaFocal(nn.Module):
     ajuste correto é reduzir a agressividade, não remover: `gamma` (padrão
     1.5, era 2.0) e `peso_confusao` (padrão 0.3, era 0.5) continuam ativos,
     só que mais fracos, e ambos seguem sob busca de hiperparâmetros.
+
+    E31 - `peso_falso_positivo`: penalidade ASSIMÉTRICA, independente de
+    `pares_confusaveis` (que fica vazio no dataset cyber, E30). Só ataca a
+    direção Normal -> Ataque (soma de `prob` em todas as classes != Normal
+    quando o rótulo verdadeiro É Normal), nunca a direção oposta -- na
+    Iteração Cyber 1 o recall de Data Manipulation já era 1.000 (0 falsos
+    negativos), então qualquer penalidade simétrica também empurraria
+    gradiente para esse lado que já está resolvido, sem ajudar o lado que
+    de fato erra (5 falsos positivos, recall Normal 0.375).
     """
-    def __init__(self, pesos_classe, gamma=1.5, pares_confusaveis=None, peso_confusao=0.3):
+    def __init__(self, pesos_classe, gamma=1.5, pares_confusaveis=None, peso_confusao=0.3,
+                 peso_falso_positivo=0.0, classe_normal=0):
         super().__init__()
         self.gamma = gamma
         self.peso_confusao = peso_confusao
         self.pares_confusaveis = list(pares_confusaveis or [])
+        self.peso_falso_positivo = peso_falso_positivo
+        self.classe_normal = classe_normal
         self.register_buffer("pesos", torch.tensor(pesos_classe, dtype=torch.float32))
 
     def forward(self, logits, alvo):
@@ -682,6 +733,11 @@ class PerdaFocal(nn.Module):
             mascara_b = (alvo == b)
             perda = perda + self.peso_confusao * mascara_a * prob[:, b]
             perda = perda + self.peso_confusao * mascara_b * prob[:, a]
+
+        if self.peso_falso_positivo > 0:
+            mascara_normal = (alvo == self.classe_normal)
+            prob_nao_normal = 1.0 - prob[:, self.classe_normal]
+            perda = perda + self.peso_falso_positivo * mascara_normal * prob_nao_normal
 
         return perda.mean()
 
@@ -795,11 +851,19 @@ def treinar_rede(config, dados_treino, num_features, epocas, pesos_classe,
     # de ataques cibernéticos tem só 2 classes (Normal/Data Manipulation),
     # não existe um terceiro par de classes minoritárias a confundir entre
     # si; a Focal Loss por si só já cobre o desbalanceamento binário.
+    # E31: `boost_normal` multiplica só o peso de classe do Normal (índice 0)
+    # POR CONFIGURAÇÃO (não no `pesos_classe` global) -- a frequência inversa
+    # sozinha fica quase 1:1 no dataset cyber, que é quase balanceado, e não
+    # dá sinal extra para o lado que erra (falsos positivos em Normal).
+    pesos_efetivos = list(pesos_classe)
+    pesos_efetivos[0] *= config.get("boost_normal", 1.0)
     criterio = PerdaFocal(
-        pesos_classe,
+        pesos_efetivos,
         gamma=config.get("gamma", 1.5),
         pares_confusaveis=None,
         peso_confusao=config.get("peso_confusao", 0.3),
+        peso_falso_positivo=config.get("peso_falso_positivo", 0.0),
+        classe_normal=0,
     ).to(device)
     ruido_treino = config.get("ruido_treino", 0.03)
 
@@ -926,6 +990,13 @@ def gerar_variacao(base, intensidade, janela_max=31):
         nova["gamma"] * random.uniform(1 - intensidade, 1 + intensidade), 0.5, 3.0))
     nova["peso_confusao"] = float(np.clip(
         nova["peso_confusao"] * random.uniform(1 - intensidade, 1 + intensidade), 0.0, 1.0))
+    # E31: boost_normal e peso_falso_positivo também sob busca -- os padrões
+    # (1.4 / 0.4) são um chute deliberado para compensar o quase-empate 1:1
+    # da frequência inversa no dataset cyber, não um ótimo conhecido.
+    nova["boost_normal"] = float(np.clip(
+        nova["boost_normal"] * random.uniform(1 - intensidade, 1 + intensidade), 1.0, 3.0))
+    nova["peso_falso_positivo"] = float(np.clip(
+        nova["peso_falso_positivo"] * random.uniform(1 - intensidade, 1 + intensidade), 0.0, 1.5))
 
     if random.random() < intensidade:
         nova["tamanho_janela"] = int(np.clip(
@@ -1102,17 +1173,26 @@ if __name__ == "__main__":
     # gamma/peso_confusao da Focal Loss (PerdaFocal) reduzidos em relação à
     # V3 para não repetir o viés de sobre-previsão de Breaker Failure; e
     # dropout_conv/dropout_rnn/ruído de treino (E25) mantidos como estavam.
+    # E32: arquitetura aprofundada para 5 camadas e dropout_conv/dropout_rnn
+    # reduzidos -- Iteração Cyber 1 já resolveu Data Manipulation (recall
+    # 1.000), o gargalo é a borda de decisão do lado Normal, que precisa de
+    # mais capacidade e menos poda para ser memorizada.
+    # E31: boost_normal e peso_falso_positivo iniciais para atacar os 5
+    # falsos positivos (Normal previsto como ataque, recall Normal 0.375)
+    # sem tocar no lado Data Manipulation, que já está perfeito.
     config_inicial = {
-        "arquitetura": [32, 64, 64, 32],
+        "arquitetura": [32, 64, 96, 64, 32],  # E32: 5 camadas (era [32, 64, 64, 32])
         "memoria": 60,
         "lr": 0.001,
         "tamanho_janela": 21,
         "weight_decay": 3e-4,      # E25: piso mais alto que a V2 (1e-4)
-        "dropout_conv": 0.25,      # E25: antes um único "dropout": 0.15
-        "dropout_rnn": 0.30,       # E25: célula recorrente sofre mais overfit
+        "dropout_conv": 0.15,      # E32: reduzido (era 0.25, E25)
+        "dropout_rnn": 0.20,       # E32: reduzido (era 0.30, E25)
         "ruido_treino": 0.03,      # E25: ruído gaussiano leve só no treino
         "gamma": 1.5,              # E29: focal de volta, menos agressiva que a V3 (2.0)
-        "peso_confusao": 0.3,      # E29: idem para o par Breaker/Busbar (V3: 0.5)
+        "peso_confusao": 0.3,      # E29: idem para o par Breaker/Busbar (V3: 0.5) -- inerte no cyber (E30)
+        "boost_normal": 1.4,       # E31: multiplica só o peso de classe Normal
+        "peso_falso_positivo": 0.4,  # E31: penaliza só a direção Normal -> Ataque
     }
 
     config_campea, _ = buscar_configuracao(
