@@ -17,6 +17,26 @@ Correções aplicadas em relação à versão original (ver relatório no chat):
   E12 - Arquivos descartados/incompletos silenciosamente -> auditoria explícita
   E13 - Conexão residual nunca ativava -> projeção linear quando as dimensões diferem
   E14 - Loss em loop Python por timestep -> vetorizada no bloco
+
+Melhorias de arquitetura aplicadas nesta revisão (RedeConvTemporal / CamadaVetorizadaBlindada):
+  E15 - Um único kernel de convolução não captura transitórios rápidos
+        (falha de disjuntor, poucas amostras) e tendências lentas
+        (subfrequência, centenas de amostras) ao mesmo tempo -> banco de
+        convoluções causais em 3 escalas (curta/média/longa), concatenadas
+        e projetadas de volta para `canais_conv`.
+  E16 - Convolução com padding "same" (kernel centrado) enxergava o FUTURO
+        da sequência em toda predição -> ramos agora são estritamente
+        causais (zero-pad só à esquerda), coerente com um relé que decide
+        em tempo real a partir apenas do passado.
+  E17 - BatchNorm exigiria estatísticas de lote e se comporta mal com
+        lote=1 (o caso de `plotar_reacao`, inferência de um arquivo só) ->
+        GroupNorm, que normaliza por amostra e é idêntica em treino/eval.
+  E18 - LayerNorm sem ganho aprendível e célula recorrente sem nenhuma
+        regularização -> ganho por neurônio na LayerNorm + dropout
+        configurável na CNN e na célula recorrente (ativo só em .train()).
+  E19 - GPU (Colab T4/A100 etc.): cuDNN benchmark + TF32 habilitados quando
+        `device == "cuda"`; toda a rede permanece 100% device-agnostic
+        (nenhum `.cuda()` hardcoded, tudo segue o device do tensor de entrada).
 """
 
 # ==============================================================================
@@ -58,11 +78,24 @@ def fixar_seed(seed=SEED):
         torch.cuda.manual_seed_all(seed)
 
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"[{'✔' if device == 'cuda' else '!'}] Dispositivo: {device}")
+import sys
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-CAMINHO_ZIP = "/content/DATASET-MESTRADO.zip"
-PASTA_EXTRAIDA = "/content/dataset_iec61850"
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"[{'OK' if device == 'cuda' else '!'}] Dispositivo: {device}")
+if device == "cuda":
+    # Robustez/velocidade em GPU (Colab T4/A100, ou qualquer CUDA local):
+    # cuDNN escolhe os kernels por benchmark (formas de tensor fixas aqui,
+    # já que os lotes são sempre (B, F, T) com T de bloco constante) e TF32
+    # é habilitado onde o hardware suporta, sem custo de precisão relevante
+    # para este problema.
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
+    print(f"    GPU: {torch.cuda.get_device_name(0)}")
+
+CAMINHO_ZIP = "/content/DATASET-MESTRADO.zip" if os.path.exists("/content/DATASET-MESTRADO.zip") else os.path.abspath("DATASET-MESTRADO.zip")
+PASTA_EXTRAIDA = "/content/dataset_iec61850" if os.path.exists("/content") else os.path.abspath("dataset_iec61850")
 
 TAMANHO_SAIDA = 4
 LOTE_ARQUIVOS = 8      # E4: o lote agora é de ARQUIVOS, não de pedaços de um arquivo
@@ -119,7 +152,7 @@ def preparar_dados_reais(caminho_zip, pasta_destino, test_size=0.20, val_size=0.
     arquivos_csv = glob.glob(os.path.join(pasta_destino, "**", "*.csv"), recursive=True)
     if not arquivos_csv:
         raise ValueError("Nenhum CSV encontrado.")
-    print(f"[✔] {len(arquivos_csv)} arquivos CSV encontrados.")
+    print(f"[OK] {len(arquivos_csv)} arquivos CSV encontrados.")
 
     # E12: auditoria explícita do que entra e do que é descartado
     auditoria = {"sem_rotulo": [], "muitas_colunas": [], "colunas_faltando": [], "vazios": []}
@@ -191,7 +224,7 @@ def preparar_dados_reais(caminho_zip, pasta_destino, test_size=0.20, val_size=0.
         resto, test_size=val_size / (1 - test_size), random_state=SEED, stratify=rotulos_resto
     )
 
-    print(f"\n[✔] Treino: {len(treino)} | Validação (seleção): {len(val)} | Teste (intocado): {len(teste)}")
+    print(f"\n[OK] Treino: {len(treino)} | Validação (seleção): {len(val)} | Teste (intocado): {len(teste)}")
     for nome, conj in [("treino", treino), ("val", val), ("teste", teste)]:
         c = collections.Counter(r for _, r in conj)
         print(f"    {nome:7s}: {[c.get(i, 0) for i in range(TAMANHO_SAIDA)]}")
@@ -207,7 +240,7 @@ def preparar_dados_reais(caminho_zip, pasta_destino, test_size=0.20, val_size=0.
         ]
 
     num_features = len(nomes_finais)  # E: não depende mais de variável vazada do loop
-    print(f"[✔] Features (base + delta): {num_features}")
+    print(f"[OK] Features (base + delta): {num_features}")
 
     return to_tensor(treino), to_tensor(val), to_tensor(teste), num_features, nomes_finais
 
@@ -254,7 +287,7 @@ def diagnosticar_separabilidade(dados, nomes_colunas, tamanho_saida=TAMANHO_SAID
 # CÉLULA 3: ARQUITETURA (CNN + RNN densamente conectada)
 # ==============================================================================
 class CamadaVetorizadaBlindada(nn.Module):
-    def __init__(self, n_neuronios, total_conexoes, tamanho_memoria):
+    def __init__(self, n_neuronios, total_conexoes, tamanho_memoria, dropout=0.0):
         super().__init__()
         self.n_neuronios = n_neuronios
         self.tamanho_memoria = tamanho_memoria
@@ -264,15 +297,30 @@ class CamadaVetorizadaBlindada(nn.Module):
         self.pesos = nn.Parameter(torch.randn(total_conexoes, n_neuronios) * escala_e)
         self.pesos_memoria = nn.Parameter(torch.randn(tamanho_memoria, n_neuronios) * escala_m)
         self.bias = nn.Parameter(torch.zeros(n_neuronios))
+        # E18: LayerNorm original não tinha ganho aprendível (só bias manual
+        # depois da normalização). Corrente/tensão/frequência normalizadas
+        # pelo RobustScaler ainda chegam em escalas internas diferentes por
+        # classe de falha; um ganho por neurônio deixa a rede reescalar cada
+        # canal em vez de herdar sempre variância unitária.
+        self.ganho = nn.Parameter(torch.ones(n_neuronios))
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.buffer_memoria = None
 
     def forward(self, entrada_completa, sinal_anterior, projecao_residual=None):
+        if entrada_completa.shape[0] != sinal_anterior.shape[0]:
+            raise ValueError(
+                f"Lote inconsistente na célula recorrente: entrada tem batch="
+                f"{entrada_completa.shape[0]}, estado anterior tem batch="
+                f"{sinal_anterior.shape[0]}. `resetar_memoria`/`resetar_estados` "
+                f"provavelmente foi chamado com um batch_size diferente do usado agora."
+            )
+
         soma = torch.matmul(entrada_completa, self.pesos)
 
         if self.tamanho_memoria > 0 and self.buffer_memoria is not None:
             soma = soma + torch.sum(self.buffer_memoria * self.pesos_memoria.unsqueeze(1), dim=0)
 
-        soma = F.layer_norm(soma, normalized_shape=[self.n_neuronios]) + self.bias
+        soma = self.ganho * F.layer_norm(soma, normalized_shape=[self.n_neuronios]) + self.bias
         novo_estado = torch.tanh(soma)
 
         # E13: no original a residual só somava se as dimensões batessem por acaso.
@@ -283,29 +331,63 @@ class CamadaVetorizadaBlindada(nn.Module):
             novo_estado = novo_estado + projecao_residual(sinal_anterior)
 
         if self.tamanho_memoria > 0 and self.buffer_memoria is not None:
+            # O buffer guarda o estado LIMPO (antes do dropout): dropout
+            # aplicado sobre o que é propagado às próximas camadas, nunca
+            # gravado na memória temporal, senão o ruído se acumularia por
+            # até centenas de passos dentro de um mesmo arquivo.
             self.buffer_memoria = torch.roll(self.buffer_memoria, shifts=-1, dims=0)
             self.buffer_memoria[-1] = novo_estado.detach()
 
-        return novo_estado
+        return self.dropout(novo_estado)
 
     def resetar_memoria(self, batch_size, device):
         if self.tamanho_memoria > 0:
             self.buffer_memoria = torch.zeros(
-                self.tamanho_memoria, batch_size, self.n_neuronios, device=device
+                self.tamanho_memoria, batch_size, self.n_neuronios,
+                device=device, dtype=self.pesos.dtype,
             )
 
 
 class RedeConvTemporal(nn.Module):
     def __init__(self, in_channels, tamanho_janela, arquitetura_ocultas, tamanho_saida,
-                 tamanho_memoria, canais_conv=16):
+                 tamanho_memoria, canais_conv=16, dropout=0.1):
         super().__init__()
-        if tamanho_janela % 2 == 0:
-            tamanho_janela += 1
-        self.tamanho_janela = tamanho_janela
+        self.tamanho_janela = max(3, int(tamanho_janela))
         self.canais_conv = canais_conv
 
-        self.conv1 = nn.Conv1d(in_channels, canais_conv,
-                               kernel_size=tamanho_janela, padding="same")
+        # E15/E16: banco de convoluções CAUSAIS em 3 escalas de tempo.
+        # Curta  -> transitórios rápidos (falha de disjuntor).
+        # Média  -> a janela configurada (busca de hiperparâmetros).
+        # Longa  -> tendências lentas (deriva de subfrequência).
+        # Cada ramo só olha para trás (padding só à esquerda, ver
+        # `forward_cnn_com_contexto`): a saída no instante t nunca depende
+        # de amostras em t+1 em diante, como exigido de um relé real.
+        curta = max(3, self.tamanho_janela // 3)
+        media = self.tamanho_janela
+        longa = min(self.tamanho_janela * 2 + 1, 61)
+        self.escalas = sorted(set([curta, media, longa]))
+        self.contexto_necessario = max(self.escalas) - 1
+
+        canais_por_ramo = max(1, canais_conv // len(self.escalas))
+        self.ramos_conv = nn.ModuleList([
+            nn.Conv1d(in_channels, canais_por_ramo, kernel_size=k, padding=0)
+            for k in self.escalas
+        ])
+        self.projecao_conv = nn.Conv1d(
+            canais_por_ramo * len(self.escalas), canais_conv, kernel_size=1
+        )
+
+        # E17: GroupNorm em vez de BatchNorm -- não depende de estatísticas
+        # de lote, então se comporta de forma idêntica em treino e em
+        # inferência de um único arquivo (B=1, o caso de `plotar_reacao`).
+        # Aplicada PONTUALMENTE (ver `_norm_conv_pontual`): por padrão o
+        # GroupNorm de um tensor (B, C, T) mistura estatísticas ao longo de
+        # T, o que vazaria amostras futuras para dentro da normalização de
+        # cada instante e quebraria a equivalência bloco == arquivo inteiro
+        # (E6). Normalizando (B*T, C, 1) cada instante usa só os próprios canais.
+        grupos = next(g for g in range(min(8, canais_conv), 0, -1) if canais_conv % g == 0)
+        self.norm_conv = nn.GroupNorm(grupos, canais_conv)
+        self.dropout_conv = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
         self.ocultas = list(arquitetura_ocultas)
         self.camadas = nn.ModuleList()
@@ -313,7 +395,7 @@ class RedeConvTemporal(nn.Module):
 
         for i, n in enumerate(self.ocultas):
             entradas = canais_conv + sum(self.ocultas[:i]) + sum(self.ocultas)
-            self.camadas.append(CamadaVetorizadaBlindada(n, entradas, tamanho_memoria))
+            self.camadas.append(CamadaVetorizadaBlindada(n, entradas, tamanho_memoria, dropout=dropout))
             largura_anterior = canais_conv if i == 0 else self.ocultas[i - 1]
             self.projecoes.append(
                 nn.Identity() if largura_anterior == n else nn.Linear(largura_anterior, n, bias=False)
@@ -328,9 +410,40 @@ class RedeConvTemporal(nn.Module):
         # ==================================================================
         self.cabeca = nn.Linear(self.ocultas[-1], tamanho_saida)
 
+    def _norm_conv_pontual(self, x):
+        """
+        x: (B, C, T) -> (B, C, T). GroupNorm normalmente reduz sobre (C/G, T)
+        juntos; aqui cada instante t é normalizado usando SÓ os próprios
+        canais, para não vazar estatísticas do futuro (nem de outros blocos
+        do TBPTT) para dentro do instante atual.
+        """
+        B, C, T = x.shape
+        x_pontual = x.permute(0, 2, 1).reshape(B * T, C, 1)
+        x_norm = self.norm_conv(x_pontual)
+        return x_norm.reshape(B, T, C).permute(0, 2, 1)
+
+    def forward_cnn_com_contexto(self, x_com_contexto):
+        """
+        x_com_contexto: (B, F, contexto_necessario + T) -> (B, canais_conv, T).
+        Os primeiros `contexto_necessario` passos devem ser amostras REAIS
+        anteriores do mesmo arquivo (ou zero, só no início dele). Usado no
+        TBPTT em blocos (`passar_lote`) para reproduzir exatamente a mesma
+        convolução causal que seria obtida rodando o arquivo inteiro de uma vez.
+        """
+        max_ctx = self.contexto_necessario
+        saidas = []
+        for conv, k in zip(self.ramos_conv, self.escalas):
+            recorte = x_com_contexto[:, :, max_ctx - (k - 1):]
+            saidas.append(conv(recorte))
+        concat = torch.cat(saidas, dim=1)
+        return self.dropout_conv(torch.relu(self._norm_conv_pontual(self.projecao_conv(concat))))
+
     def forward_cnn(self, x):
-        """x: (B, F, T) -> (B, canais_conv, T)"""
-        return torch.relu(self.conv1(x))
+        """x: (B, F, T) -> (B, canais_conv, T). Uso em sequência completa (ex.:
+        `plotar_reacao`): zero-preenche o início do arquivo -- antes da
+        primeira amostra não existe passado nenhum -- e delega ao caminho
+        com contexto."""
+        return self.forward_cnn_com_contexto(F.pad(x, (self.contexto_necessario, 0)))
 
     def forward_rnn(self, sinal_t):
         """sinal_t: (B, canais_conv) -> logits (B, tamanho_saida)"""
@@ -389,20 +502,27 @@ def passar_lote(rede, x, y, criterio, otimizador, tamanho_bloco, treinar):
     B, T, _ = x.shape
     rede.resetar_estados(B, x.device)
 
-    # E6: no original a CNN via blocos de 60 no treino (com zero-padding dominando
-    # um kernel de 21) e o arquivo inteiro na inferência -> features diferentes nas
-    # duas fases. Aqui cada bloco é convoluído COM CONTEXTO das bordas e depois
-    # recortado, o que reproduz exatamente a convolução sobre a sequência inteira.
-    margem = rede.tamanho_janela // 2
+    # E6/E16: no original a CNN via blocos de 60 no treino (com zero-padding
+    # dominando um kernel de 21) e o arquivo inteiro na inferência -> features
+    # diferentes nas duas fases; além disso o padding "same" centrado deixava
+    # cada bloco enxergar amostras FUTURAS em relação ao instante avaliado.
+    # Agora a CNN é causal: cada bloco recebe como contexto só as amostras
+    # REAIS anteriores do próprio arquivo (zero-padding apenas no primeiro
+    # bloco, onde não existe passado), reproduzindo exatamente a convolução
+    # causal que se obteria rodando o arquivo inteiro de uma vez.
+    margem = rede.contexto_necessario
 
     perdas, logits_todos = [], []
     for ini in range(0, T, tamanho_bloco):
         fim = min(ini + tamanho_bloco, T)
-        a, b = max(0, ini - margem), min(T, fim + margem)
+        a = max(0, ini - margem)
 
-        feats_ctx = rede.forward_cnn(x[:, a:b, :].permute(0, 2, 1))
-        desloc = ini - a
-        feats = feats_ctx[:, :, desloc:desloc + (fim - ini)]
+        trecho = x[:, a:fim, :].permute(0, 2, 1)
+        pad_esquerdo = margem - (ini - a)
+        if pad_esquerdo > 0:
+            trecho = F.pad(trecho, (pad_esquerdo, 0))
+
+        feats = rede.forward_cnn_com_contexto(trecho)
 
         saidas = [rede.forward_rnn(feats[:, :, t]) for t in range(fim - ini)]
         logits = torch.stack(saidas, dim=0)                       # (Tb, B, C)
@@ -561,13 +681,13 @@ def buscar_configuracao(config_inicial, dados_treino, dados_val, num_features, p
 
             if fit > melhor:
                 melhor, campea = fit, copy.deepcopy(cand)
-                print("  ⭐ nova campeã")
+                print("  [*] nova campeã")
 
             del rede
             if device == "cuda":
                 torch.cuda.empty_cache()
 
-    print(f"\n[✔] Melhor aptidão em validação: {melhor * 100:.2f}%")
+    print(f"\n[OK] Melhor aptidão em validação: {melhor * 100:.2f}%")
     print(f"    Config: {campea}")
     return campea, melhor
 
@@ -651,7 +771,9 @@ def plotar_reacao(rede, dados, nomes_colunas, indice=0):
     fig.legend(handles=legendas, loc="lower center", ncol=4,
                bbox_to_anchor=(0.5, -0.06), fontsize=11)
     plt.tight_layout()
-    plt.show()
+    plt.savefig("reacao_modelo.png", bbox_inches="tight")
+    print("[OK] Gráfico salvo em 'reacao_modelo.png'")
+    plt.close()
     rede.train()
 
 
